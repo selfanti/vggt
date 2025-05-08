@@ -10,7 +10,10 @@ from PIL import Image
 import cv2
 import requests
 import tempfile
-
+import json
+from scipy.spatial.transform import Rotation
+import subprocess
+import shutil
 sys.path.append("vggt/")
 
 from vggt.models.vggt import VGGT
@@ -18,6 +21,187 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 
+
+def run_colmap_bundle_adjustment(colmap_dir, options_dict=None):
+    """
+    Run COLMAP's bundle adjustment on the exported data.
+
+    Args:
+        colmap_dir (str): Path to the directory containing COLMAP files
+        options_dict (dict, optional): Dictionary of options to pass to bundle_adjuster
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+
+
+    # Check if COLMAP is installed
+    colmap_path = shutil.which("colmap")
+    if colmap_path is None:
+        print("Error: COLMAP not found. Please install COLMAP or add it to your PATH.")
+        return False
+
+        # Default options for bundle adjustment
+    default_options = {
+        "BundleAdjustment.max_num_iterations": "100",
+        "BundleAdjustment.max_linear_solver_iterations": "200",
+        "BundleAdjustment.function_tolerance": "0.0000001",
+        "BundleAdjustment.gradient_tolerance": "0.0000001",
+        "BundleAdjustment.parameter_tolerance": "0.0000001"
+    }
+
+    # Update with user options if provided
+    if options_dict:
+        default_options.update(options_dict)
+
+        # Build options string
+    options_str = " ".join([f"--{key}={value}" for key, value in default_options.items()])
+
+    # Build command
+    cmd = f"{colmap_path} bundle_adjuster --input_path {colmap_dir} --output_path {colmap_dir} {options_str}"
+
+    print(f"Running COLMAP bundle adjustment with command:\n{cmd}")
+    try:
+        subprocess.run(cmd, shell=True, check=True)
+        print("Bundle adjustment completed successfully.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error running bundle adjustment: {e}")
+        return False
+
+
+def import_colmap_to_vggt(colmap_dir, predictions):
+    """
+    Import refined COLMAP data back into VGGT predictions.
+
+    Args:
+        colmap_dir (str): Path to the directory containing COLMAP files
+        predictions (dict): VGGT predictions dictionary
+
+    Returns:
+        dict: Updated VGGT predictions
+    """
+
+
+    # Read COLMAP cameras
+    cameras = read_colmap_cameras(os.path.join(colmap_dir, "cameras.bin"))
+
+    # Read COLMAP images (camera poses)
+    images = read_colmap_images(os.path.join(colmap_dir, "images.bin"))
+
+    # Read COLMAP points
+    points3D = read_colmap_points3D(os.path.join(colmap_dir, "points3D.bin"))
+
+    # Update extrinsic parameters
+    num_cameras = len(predictions["extrinsic"])
+    refined_extrinsics = np.zeros_like(predictions["extrinsic"])
+
+    for i in range(num_cameras):
+        # Get camera pose from COLMAP
+        img_id = i + 1  # COLMAP uses 1-indexed IDs
+        if img_id in images:
+            qvec = images[img_id].qvec  # [qw, qx, qy, qz]
+            tvec = images[img_id].tvec
+
+            # Convert quaternion to rotation matrix
+            r = Rotation.from_quat([qvec[1], qvec[2], qvec[3], qvec[0]])  # [qx, qy, qz, qw]
+            rot_mat = r.as_matrix()
+
+            # Construct extrinsic matrix [R|t] (camera-to-world)
+            extrinsic = np.eye(4)
+            extrinsic[:3, :3] = rot_mat
+            extrinsic[:3, 3] = tvec
+
+            # Convert to world-to-camera for VGGT format
+            refined_extrinsics[i, :3, :4] = np.linalg.inv(extrinsic)[:3, :4]
+
+            # Update intrinsic parameters
+    refined_intrinsics = np.zeros_like(predictions["intrinsic"])
+    for i in range(num_cameras):
+        cam_id = i + 1  # COLMAP uses 1-indexed IDs
+        if cam_id in cameras:
+            # For PINHOLE model
+            fx, fy, cx, cy = cameras[cam_id].params
+            K = np.eye(3)
+            K[0, 0] = fx
+            K[1, 1] = fy
+            K[0, 2] = cx
+            K[1, 2] = cy
+            refined_intrinsics[i] = K
+
+            # Update predictions
+    predictions["extrinsic_refined"] = refined_extrinsics
+    predictions["intrinsic_refined"] = refined_intrinsics
+
+    # Optionally update 3D points if needed
+
+    return predictions
+def pose_encoding_to_extri_intri(
+    pose_encoding,
+    image_size_hw=None,  # e.g., (256, 512)
+    pose_encoding_type="absT_quaR_FoV",
+    build_intrinsics=True,
+):
+    """Convert a pose encoding back to camera extrinsics and intrinsics.
+
+    This function performs the inverse operation of extri_intri_to_pose_encoding,
+    reconstructing the full camera parameters from the compact encoding.
+
+    Args:
+        pose_encoding (torch.Tensor): Encoded camera pose parameters with shape BxSx9,
+            where B is batch size and S is sequence length.
+            For "absT_quaR_FoV" type, the 9 dimensions are:
+            - [:3] = absolute translation vector T (3D)
+            - [3:7] = rotation as quaternion quat (4D)
+            - [7:] = field of view (2D)
+        image_size_hw (tuple): Tuple of (height, width) of the image in pixels.
+            Required for reconstructing intrinsics from field of view values.
+            For example: (256, 512).
+        pose_encoding_type (str): Type of pose encoding used. Currently only
+            supports "absT_quaR_FoV" (absolute translation, quaternion rotation, field of view).
+        build_intrinsics (bool): Whether to reconstruct the intrinsics matrix.
+            If False, only extrinsics are returned and intrinsics will be None.
+
+    Returns:
+        tuple: (extrinsics, intrinsics)
+            - extrinsics (torch.Tensor): Camera extrinsic parameters with shape BxSx3x4.
+              In OpenCV coordinate system (x-right, y-down, z-forward), representing camera from world
+              transformation. The format is [R|t] where R is a 3x3 rotation matrix and t is
+              a 3x1 translation vector.
+            - intrinsics (torch.Tensor or None): Camera intrinsic parameters with shape BxSx3x3,
+              or None if build_intrinsics is False. Defined in pixels, with format:
+              [[fx, 0, cx],
+               [0, fy, cy],
+               [0,  0,  1]]
+              where fx, fy are focal lengths and (cx, cy) is the principal point,
+              assumed to be at the center of the image (W/2, H/2).
+    """
+
+    intrinsics = None
+
+    if pose_encoding_type == "absT_quaR_FoV":
+        T = pose_encoding[..., :3]
+        quat = pose_encoding[..., 3:7]
+        fov_h = pose_encoding[..., 7]
+        fov_w = pose_encoding[..., 8]
+
+        R = quat_to_mat(quat)
+        extrinsics = torch.cat([R, T[..., None]], dim=-1)
+
+        if build_intrinsics:
+            H, W = image_size_hw
+            fy = (H / 2.0) / torch.tan(fov_h / 2.0)
+            fx = (W / 2.0) / torch.tan(fov_w / 2.0)
+            intrinsics = torch.zeros(pose_encoding.shape[:2] + (3, 3), device=pose_encoding.device)
+            intrinsics[..., 0, 0] = fx
+            intrinsics[..., 1, 1] = fy
+            intrinsics[..., 0, 2] = W / 2
+            intrinsics[..., 1, 2] = H / 2
+            intrinsics[..., 2, 2] = 1.0  # Set the homogeneous coordinate to 1
+    else:
+        raise NotImplementedError
+
+    return extrinsics, intrinsics
 def load_model(device=None):
     """Load and initialize the VGGT model."""
     if device is None:
@@ -542,7 +726,10 @@ def main():
     parser.add_argument("--prediction_mode", type=str, default="Depthmap and Camera Branch",
                         choices=["Depthmap and Camera Branch", "Pointmap Branch"],
                         help="Which prediction branch to use")
-    
+    parser.add_argument("--run_ba", action="store_true",
+                        help="Run COLMAP's bundle adjustment after export")
+    parser.add_argument("--ba_options", type=str, default=None,
+                        help="JSON string of bundle adjustment options")
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -590,6 +777,20 @@ def main():
             points3D)
     
     print(f"COLMAP files successfully written to {args.output_dir}")
+    if args.run_ba:
+        print("Running bundle adjustment...")
+        ba_options = json.loads(args.ba_options) if args.ba_options else None
+        success = run_colmap_bundle_adjustment(args.output_dir, ba_options)
 
+        if success and args.import_refined:
+            print("Importing refined parameters back to VGGT format...")
+            refined_predictions = import_colmap_to_vggt(args.output_dir, predictions)
+
+            # Save refined predictions
+            refined_output = os.path.join(args.output_dir, "vggt_refined.npz")
+            np.savez(refined_output, **refined_predictions)
+            print(f"Refined VGGT predictions saved to {refined_output}")
+#command: python vggt_to_colmap.py --image_dir /path/to/images --output_dir colmap_output --run_ba --import_refined
+#python vggt_to_colmap.py --image_dir /path/to/images --output_dir colmap_output --run_ba --ba_options '{"BundleAdjustment.max_num_iterations": "200"}'
 if __name__ == "__main__":
     main()
